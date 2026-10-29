@@ -1,6 +1,6 @@
 # 🎭 Uno-Reverse Feed Filters for Instagram & Bluesky
 
-A pair of *ruthlessly judgmental* userscripts that intercept social media feeds and delete content from accounts that are clearly not here for personal vibes (we see you *marketofficial.io policegirl69*). Designed for posting to GitHub so others can benefit from your displeasure with AI spam, brand funnels, and general nonsense.
+A pair of *ruthlessly judgmental* userscripts that intercept social media feeds and delete content from accounts that are clearly not here for personal vibes (we see you *marketofficial.io policegirl69*). Designed for posting to GitHub so others can benefit from my displeasure with AI spam, brand funnels, and general nonsense.
 
 These work by injecting into the browser and filtering *before* the social apps ever get a chance to show you garbage. If you don’t understand what XHR/fetch interception is, don’t touch this — the code bites if you poke it with a stick.
 
