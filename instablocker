@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instagram Uno-Reverse Feed Filter (Full Intercept + Aggressive Bait Filters)
 // @namespace    local
-// @version      4.0.0
+// @version      4.1.0
 // @description  Intercepts IG network responses (fetch + XHR) and strips matched content before UI renders it.
 // @match        https://www.instagram.com/*
 // @run-at       document-start
@@ -39,7 +39,7 @@
     "your_username_here",
   ].map(s => String(s).toLowerCase()));
 
-  const normalize = (s) => String(s || "").trim().toLowerCase();
+  const normalize = (s) => String(s || "").trim().replace(/^@/, "").toLowerCase();
   const isExcluded = (u) => EXCLUDED_USERNAMES.has(normalize(u));
 
   /**********************
@@ -71,7 +71,7 @@
     /\bwholesale\b/i,
     /\bmerch\b/i,
     /\bproduct(s)?\b/i,
-    /\eric_hexter,
+    /^eric_hexter$/i,
 
     // spam verticals
     /\bcrypto\b/i,
@@ -197,140 +197,121 @@
   }
 
   /**********************
-   * URL / ENDPOINT INTERCEPT
-   **********************/
-  const URL_ALLOWLIST = [
-    "/graphql/query",
-    "/graphql/",
-    "/api/",
-    "/api/v1/",
-    "/api/v1/feed/",
-    "/api/v1/discover/",
-  ];
-
-  function shouldProcessUrl(url) {
-    try {
-      const u = new URL(url, location.href);
-      return URL_ALLOWLIST.some(part => u.pathname.includes(part));
-    } catch {
-      return URL_ALLOWLIST.some(part => String(url).includes(part));
-    }
-  }
-
-  /**********************
-   * OWNER / USERNAME EXTRACTION (FALLBACK HEURISTICS)
-   **********************/
-  function extractPossibleUsername(obj) {
-    if (!obj || typeof obj !== "object") return null;
-
-    // common
-    if (typeof obj.username === "string") return obj.username;
-
-    // ig-ish
-    if (obj.user && typeof obj.user.username === "string") return obj.user.username;
-    if (obj.owner && typeof obj.owner.username === "string") return obj.owner.username;
-    if (obj.author && typeof obj.author.username === "string") return obj.author.username;
-
-    // graphql-ish
-    if (obj.node && typeof obj.node.username === "string") return obj.node.username;
-    if (obj.user && obj.user.user && typeof obj.user.user.username === "string") return obj.user.user.username;
-
-    // reels/media shapes sometimes bury it
-    if (obj.user && obj.user.reel && typeof obj.user.reel.username === "string") return obj.user.reel.username;
-
-    return null;
-  }
-
-  function extractPossibleCaption(obj) {
-    if (!obj || typeof obj !== "object") return null;
-
-    // common/simple
-    if (obj.caption && typeof obj.caption.text === "string") return obj.caption.text;
-
-    // graphql caption edges
-    const edgeText = obj.edge_media_to_caption?.edges?.[0]?.node?.text;
-    if (typeof edgeText === "string") return edgeText;
-
-    // sometimes nested
-    if (obj.post && obj.post.caption && typeof obj.post.caption.text === "string") return obj.post.caption.text;
-
-    // last resort: some payloads include "text" fields directly (dangerous, but useful)
-    if (typeof obj.text === "string" && obj.text.length < 5000) return obj.text;
-
-    return null;
-  }
-
-  /**********************
-   * DECISION: SHOULD REMOVE THIS ITEM?
+   * CONTENT SIGNALS
    **********************/
   function shouldRemoveBySignals(username, caption) {
-    if (!username) return false;
-    if (isExcluded(username)) return false;
-
-    // handle patterns
-    if (matchesAny(username, USERNAME_REGEXES)) return true;
-
-    // caption patterns
-    if (matchesAny(caption, RELIGIOUS_REGEXES)) return true;
-    if (matchesAny(caption, BAIT_REGEXES)) return true;
-    if (matchesAny(caption, THIRST_FUNNEL_REGEXES)) return true;
-
-    // transition monetization funnel (requires both)
-    if (matchesTransitionFunnel(caption)) return true;
-
-    return false;
+    if (!username || isExcluded(username)) return false;
+    return matchesAny(username, USERNAME_REGEXES) ||
+      matchesAny(caption, RELIGIOUS_REGEXES) ||
+      matchesAny(caption, BAIT_REGEXES) ||
+      matchesAny(caption, THIRST_FUNNEL_REGEXES) ||
+      matchesTransitionFunnel(caption);
   }
 
-  /**********************
-   * GENERIC JSON SCRUBBER (RECURSIVE)
-   *
-   * Strategy:
-   *  - walk everything
-   *  - if we see arrays, filter items whose "owner" matches
-   *  - also look at caption text when present
-   *  - avoid infinite loops via WeakSet
-   **********************/
-  function scrubJson(data) {
-    const seen = new WeakSet();
-
-    function walk(node) {
-      if (!node || typeof node !== "object") return node;
-      if (seen.has(node)) return node;
-      seen.add(node);
-
-      if (Array.isArray(node)) {
-        const out = [];
-        for (const item of node) {
-          const username = extractPossibleUsername(item);
-          const caption = extractPossibleCaption(item);
-
-          if (username && shouldRemoveBySignals(username, caption)) {
-            log("Yeeted array item from:", username);
-            continue;
-          }
-
-          out.push(walk(item));
-        }
-        return out;
+  // Only inspect feed/explore/clip REST responses and GraphQL on this origin.
+  // GraphQL shares its URL with settings, DMs, comments and mutations, so the
+  // response must ALSO contain a recognized feed collection before we edit it.
+  function endpointKind(input) {
+    try {
+      const url = new URL(typeof input === "string" ? input : input?.url || input,
+        location.href);
+      if (url.origin !== location.origin) return null;
+      if (/^\/graphql(?:\/|$)/.test(url.pathname) || url.pathname === "/api/graphql") {
+        return "graphql";
       }
-
-      // Walk object properties
-      for (const k of Object.keys(node)) {
-        node[k] = walk(node[k]);
+      if (/^\/api\/v1\/feed\/(?:timeline|user\/[^/]+|tag\/[^/]+)\/?$/.test(url.pathname)) {
+        return "feed";
       }
-
-      // If this object *itself* looks like content owned by a matched username, null it out.
-      const username = extractPossibleUsername(node);
-      const caption = extractPossibleCaption(node);
-      if (username && shouldRemoveBySignals(username, caption)) {
-        log("Neutered object owned by:", username);
-        return null;
+      if (/^\/api\/v1\/clips\/(?:discover|connected|user)\/?$/.test(url.pathname)) {
+        return "clips";
       }
+      if (/^\/api\/v1\/discover\/explore\/?$/.test(url.pathname)) return "explore";
+    } catch {}
+    return null;
+  }
 
-      return node;
+  function mediaFromItem(item) {
+    // Unwrap only known feed envelopes. Do not mistake bare user/comment objects
+    // for posts, and never recursively delete an owner or carousel child.
+    let media = item;
+    for (let i = 0; i < 4 && media && typeof media === "object"; i++) {
+      const nested = media.node || media.media_or_ad || media.media || media.clip;
+      if (!nested) break;
+      media = nested;
+    }
+    if (!media || typeof media !== "object") return null;
+    const hasId = media.id != null || media.pk != null || typeof media.code === "string" ||
+      typeof media.shortcode === "string";
+    const hasMediaShape = media.media_type != null || media.product_type != null ||
+      media.image_versions2 != null || media.video_versions != null ||
+      media.display_url != null || /^(?:GraphImage|GraphVideo|GraphSidecar)$/.test(media.__typename || "");
+    return hasId && hasMediaShape ? media : null;
+  }
+
+  function shouldRemoveItem(item) {
+    const media = mediaFromItem(item);
+    if (!media) return false;
+    const username = media.user?.username || media.owner?.username;
+    const caption = typeof media.caption === "string" ? media.caption :
+      media.caption?.text || media.edge_media_to_caption?.edges?.[0]?.node?.text || "";
+    return shouldRemoveBySignals(username, caption);
+  }
+
+  function scrubJson(data, kind) {
+    let changed = false;
+    function filterCollection(container, key) {
+      if (!Array.isArray(container?.[key])) return;
+      const before = container[key];
+      const after = before.filter(item => !shouldRemoveItem(item));
+      if (after.length !== before.length) {
+        container[key] = after;
+        changed = true;
+        log("Removed feed entries:", before.length - after.length);
+      }
     }
 
-    return walk(data);
+    if (kind === "feed") {
+      filterCollection(data, "feed_items");
+      filterCollection(data, "items");
+    } else if (kind === "clips") {
+      filterCollection(data, "items");
+    } else if (kind === "explore" && Array.isArray(data?.sectional_items)) {
+      // Keep section/layout objects intact, including their pagination metadata.
+      for (const section of data.sectional_items) {
+        filterCollection(section?.layout_content, "medias");
+        filterCollection(section?.layout_content, "fill_items");
+        filterCollection(section?.layout_content, "one_by_two_item");
+      }
+    } else if (kind === "graphql") {
+      // Explicit known media connections, not arbitrary arrays or user lists.
+      const connectionName = /^(?:xdt_api__v1__(?:feed__(?:timeline|user|tag)|clips__(?:home|discover|connected|user))__connection|edge_web_feed_timeline|edge_owner_to_timeline_media|edge_hashtag_to_media)$/;
+      const seen = new WeakSet();
+      function walk(node) {
+        if (!node || typeof node !== "object" || seen.has(node)) return;
+        seen.add(node);
+        for (const key of Object.keys(node)) {
+          if (connectionName.test(key)) {
+            filterCollection(node[key], "edges");
+            // Do not inspect inside media or mutate nested owner/comment data.
+          } else {
+            walk(node[key]);
+          }
+        }
+      }
+      walk(data);
+    }
+    return changed;
+  }
+
+  function isJson(contentType) {
+    return /(?:application\/(?:[\w.-]+\+)?json|text\/javascript)(?:\s*;|$)/i.test(contentType || "");
+  }
+
+  function filterText(text, kind) {
+    // Instagram sometimes sends an anti-JSON-hijacking prefix. Keep it intact.
+    const prefix = text.match(/^\s*for\s*\(;;\);\s*/)?.[0] || "";
+    const json = JSON.parse(text.slice(prefix.length));
+    return scrubJson(json, kind) ? prefix + JSON.stringify(json) : text;
   }
 
   /**********************
@@ -338,112 +319,90 @@
    **********************/
   const realFetch = window.fetch;
 
-  window.fetch = async function(input, init) {
-    const url = typeof input === "string" ? input : (input && input.url) || "";
-
-    if (!shouldProcessUrl(url)) {
-      return realFetch.apply(this, arguments);
+  function preserveResponseMetadata(response, original) {
+    for (const key of ["url", "redirected", "type"]) {
+      Object.defineProperty(response, key, { value: original[key], configurable: true });
     }
+    const clone = response.clone;
+    Object.defineProperty(response, "clone", {
+      value() { return preserveResponseMetadata(clone.call(this), original); },
+      configurable: true,
+    });
+    return response;
+  }
 
-    const resp = await realFetch.apply(this, arguments);
-
-    const ct = resp.headers.get("content-type") || "";
-    if (!ct.includes("application/json") && !ct.includes("text/javascript")) {
-      return resp;
-    }
-
+  window.fetch = async function(input) {
+    const response = await realFetch.apply(this, arguments);
+    const kind = endpointKind(input);
+    if (!kind || !response.ok || !isJson(response.headers.get("content-type"))) return response;
     try {
-      const cloned = resp.clone();
-      const text = await cloned.text();
-
-      let json;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        return resp;
-      }
-
-      const scrubbed = scrubJson(json);
-      const newBody = JSON.stringify(scrubbed);
-
-      log("Filtered fetch response:", url);
-
-      return new Response(newBody, {
-        status: resp.status,
-        statusText: resp.statusText,
-        headers: resp.headers,
-      });
-    } catch (e) {
-      log("Fetch filter error; returning original:", e);
-      return resp;
+      const text = await response.clone().text();
+      const filtered = filterText(text, kind);
+      if (filtered === text) return response;
+      const headers = new Headers(response.headers);
+      // The browser already decoded the body; these describe the old wire bytes.
+      headers.delete("content-length");
+      headers.delete("content-encoding");
+      return preserveResponseMetadata(new Response(filtered, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      }), response);
+    } catch (error) {
+      log("Fetch filter left original response intact:", error);
+      return response;
     }
   };
 
   /**********************
-   * XHR INTERCEPT (FALLBACK)
+   * XHR INTERCEPT
    **********************/
-  const RealXHR = window.XMLHttpRequest;
+  // Keep the native constructor, constants, prototype and event dispatch intact.
+  // Native response getters work for onload AND addEventListener consumers and
+  // respect responseType. A readystatechange wrapper cannot guarantee this.
+  const prototype = window.XMLHttpRequest.prototype;
+  const requests = new WeakMap();
+  const realOpen = prototype.open;
+  const textDescriptor = Object.getOwnPropertyDescriptor(prototype, "responseText");
+  const responseDescriptor = Object.getOwnPropertyDescriptor(prototype, "response");
 
-  function PatchedXHR() {
-    const xhr = new RealXHR();
-    let requestUrl = "";
-
-    const realOpen = xhr.open;
-    xhr.open = function(method, url) {
-      requestUrl = url || "";
-      return realOpen.apply(this, arguments);
-    };
-
-    const realSend = xhr.send;
-    xhr.send = function() {
-      if (!shouldProcessUrl(requestUrl)) {
-        return realSend.apply(this, arguments);
+  function filteredXhrResponse(xhr, raw) {
+    const request = requests.get(xhr);
+    if (!request?.kind || xhr.readyState !== 4 || xhr.status < 200 || xhr.status >= 300 ||
+        !isJson(xhr.getResponseHeader("content-type"))) return raw;
+    if (request.cached && request.raw === raw) return request.filtered;
+    let filtered = raw;
+    try {
+      if (typeof raw === "string") filtered = filterText(raw, request.kind);
+      else if (xhr.responseType === "json" && raw && typeof raw === "object") {
+        const copy = JSON.parse(JSON.stringify(raw));
+        if (scrubJson(copy, request.kind)) filtered = copy;
       }
-
-      const origOnReady = xhr.onreadystatechange;
-
-      xhr.onreadystatechange = function() {
-        try {
-          if (xhr.readyState === 4) {
-            const ct = xhr.getResponseHeader("content-type") || "";
-            if (ct.includes("application/json") || ct.includes("text/javascript")) {
-              let json;
-              try {
-                json = JSON.parse(xhr.responseText);
-              } catch {
-                json = null;
-              }
-
-              if (json) {
-                const scrubbed = scrubJson(json);
-                const newTxt = JSON.stringify(scrubbed);
-
-                // Best-effort patching: some browsers lock these down, but often it works.
-                try {
-                  Object.defineProperty(xhr, "responseText", { get: () => newTxt });
-                } catch {}
-                try {
-                  Object.defineProperty(xhr, "response", { get: () => newTxt });
-                } catch {}
-
-                log("Filtered XHR response:", requestUrl);
-              }
-            }
-          }
-        } catch (e) {
-          log("XHR filter error:", e);
-        }
-
-        if (origOnReady) return origOnReady.apply(this, arguments);
-      };
-
-      return realSend.apply(this, arguments);
-    };
-
-    return xhr;
+    } catch (error) {
+      log("XHR filter left original response intact:", error);
+    }
+    request.raw = raw;
+    request.filtered = filtered;
+    request.cached = true;
+    return filtered;
   }
 
-  window.XMLHttpRequest = PatchedXHR;
+  // If a browser does not permit getter interception, leave XHR untouched.
+  if (textDescriptor?.get && responseDescriptor?.get &&
+      textDescriptor.configurable && responseDescriptor.configurable) {
+    prototype.open = function(method, url) {
+      requests.set(this, { kind: endpointKind(url), cached: false });
+      return realOpen.apply(this, arguments);
+    };
+    Object.defineProperty(prototype, "responseText", {
+      ...textDescriptor,
+      get() { return filteredXhrResponse(this, textDescriptor.get.call(this)); },
+    });
+    Object.defineProperty(prototype, "response", {
+      ...responseDescriptor,
+      get() { return filteredXhrResponse(this, responseDescriptor.get.call(this)); },
+    });
+  }
 
-  log("Loaded. Instagram will now receive a slightly less cursed reality.");
+  log("Loaded. Filtering recognized feed collections only.");
 })();
